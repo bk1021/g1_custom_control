@@ -72,6 +72,7 @@ void G1MoveItBridge::lowstate_callback(const unitree_hg::msg::LowState::SharedPt
     joint_state_msg.header.stamp = this->now();
 
     std::lock_guard<std::mutex> lock(state_mutex_);
+    mode_machine_ = msg->mode_machine;
     for (int i = 0; i < G1_NUM_MOTOR; i++) {
         current_q_[i] = msg->motor_state[i].q;
         current_dq_[i] = msg->motor_state[i].dq;
@@ -95,8 +96,8 @@ void G1MoveItBridge::control_loop() {
     if (!initial_q_captured_) return;
 
     unitree_hg::msg::LowCmd low_cmd;
-    low_cmd.mode_pr = 0;
-    low_cmd.mode_machine = 0;
+    low_cmd.mode_pr = mode_pr_;
+    low_cmd.mode_machine = mode_machine_;
 
     // Ramp up from 0.0 to 1.0 over 2 seconds (2.0s * 500Hz = 1000 ticks)
     if (hc_weight_ < 1.0) {
@@ -253,8 +254,8 @@ G1MoveItBridge::~G1MoveItBridge() {
     RCLCPP_INFO(this->get_logger(), "Shutting down... Handing arm control back to Unitree AI.");
     
     unitree_hg::msg::LowCmd low_cmd;
-    low_cmd.mode_pr = 0;
-    low_cmd.mode_machine = 0;
+    low_cmd.mode_pr = mode_pr_;
+    low_cmd.mode_machine = mode_machine_;
 
     // Ramp weight down from 1.0 to 0.0 over 1 second (500 ticks at 2ms)
     for (int step = 0; step <= 500; ++step) {

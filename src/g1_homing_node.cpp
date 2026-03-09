@@ -57,6 +57,7 @@ public:
     lowstate_subscriber_ = this->create_subscription<unitree_hg::msg::LowState>(
         "lowstate", 10,
         [this](const unitree_hg::msg::LowState::SharedPtr msg) {
+          mode_machine_ = msg->mode_machine;
           for (int i = 0; i < G1_NUM_MOTOR; i++) {
             current_q_[i] = msg->motor_state[i].q; // Store live position
             
@@ -100,8 +101,8 @@ private:
     if (!initial_q_captured_) return;
 
     unitree_hg::msg::LowCmd low_cmd;
-    low_cmd.mode_pr = 0;
-    low_cmd.mode_machine = 0;
+    low_cmd.mode_pr = mode_pr_;
+    low_cmd.mode_machine = mode_machine_;
 
     time_ += 0.002; 
     double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
@@ -139,6 +140,8 @@ private:
   
   std::array<float, G1_NUM_MOTOR> initial_q_{0};
   std::array<float, G1_NUM_MOTOR> current_q_{0};
+  uint8_t mode_pr_ = 0;
+  uint8_t mode_machine_ = 0;
   int print_counter_ = 0;
   bool initial_q_captured_ = false;
   bool homing_complete_printed_ = false;

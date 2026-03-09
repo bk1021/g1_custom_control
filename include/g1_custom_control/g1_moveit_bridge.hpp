@@ -62,6 +62,9 @@ private:
     bool initial_q_captured_ = false;
     std::mutex state_mutex_;
 
+    uint8_t mode_pr_ = 0;
+    uint8_t mode_machine_ = 0;
+
     double hc_weight_ = 0.0;
     // Note: In Unitree's HG SDK, the weight gate is often passed in an unused motor index
     const int WEIGHT_GATE_INDEX = 29;
