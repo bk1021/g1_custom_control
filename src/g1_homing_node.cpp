@@ -120,9 +120,9 @@ private:
       low_cmd.motor_cmd[i].kp = GetMotorKp(G1MotorType[i]); 
       low_cmd.motor_cmd[i].kd = GetMotorKd(G1MotorType[i]);
       
-      if (i == 14) {
-          low_cmd.motor_cmd[i].kp = 120.0; // Increase from 40 to 120
-      }
+      // if (i == 14) {
+      //     low_cmd.motor_cmd[i].kp = 120.0; // Increase from 40 to 120
+      // }
     }
 
     get_crc(low_cmd);
