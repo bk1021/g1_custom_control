@@ -26,11 +26,15 @@ float GetMotorKd(MotorType type) {
 }
 
 const std::vector<std::string> JOINT_NAMES = {
-    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
-    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", 
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", 
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
     "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", 
+    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", 
+    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"
 };
 
 G1MoveItBridge::G1MoveItBridge(bool keep_lowbody_home) 
@@ -76,8 +80,6 @@ void G1MoveItBridge::lowstate_callback(const unitree_hg::msg::LowState::SharedPt
     for (int i = 0; i < G1_NUM_MOTOR; i++) {
         current_q_[i] = msg->motor_state[i].q;
         current_dq_[i] = msg->motor_state[i].dq;
-        // Capture the estimated torque for gravity compensation
-        current_tau_est_[i] = msg->motor_state[i].tau_est;
 
         joint_state_msg.name.push_back(JOINT_NAMES[i]);
         joint_state_msg.position.push_back(current_q_[i]);
@@ -130,8 +132,7 @@ void G1MoveItBridge::control_loop() {
         } else {
             low_cmd.motor_cmd[i].q = target_q_[i];
             low_cmd.motor_cmd[i].dq = 0.0;
-            // Feedforward Torque to prevent arm sag on real metal hardware
-            low_cmd.motor_cmd[i].tau = current_tau_est_[i]; 
+            low_cmd.motor_cmd[i].tau = 0.0;
             low_cmd.motor_cmd[i].kp = GetMotorKp(G1MotorType[i]);
             low_cmd.motor_cmd[i].kd = GetMotorKd(G1MotorType[i]);
         }
@@ -199,14 +200,7 @@ void G1MoveItBridge::execute_trajectory(const std::shared_ptr<GoalHandleFJT> goa
 
                 // Interpolate from the ACTUAL position for the first segment
                 double start_angle = (i == 1) ? actual_start_q[motor_id] : prev_point.positions[j];
-                double desired_target = start_angle + ratio * (target_point.positions[j] - start_angle);
-                
-                // Physically clamp the max allowed change per 2ms tick to prevent gear stripping.
-                // Max speed: 2.0 radians/sec = 0.004 radians per 2ms tick.
-                double max_delta = MAX_JOINT_SPEED * 0.002; 
-                double delta = desired_target - current_q_[motor_id];
-
-                target_q_[motor_id] = current_q_[motor_id] + std::clamp(delta, -max_delta, max_delta);
+                target_q_[motor_id] = start_angle + ratio * (target_point.positions[j] - start_angle);
             }
             loop_rate.sleep();
         }
@@ -267,7 +261,7 @@ G1MoveItBridge::~G1MoveItBridge() {
             if (i >= 15) { // Keep holding the arms steady while fading the weight
                 low_cmd.motor_cmd[i].q = target_q_[i];
                 low_cmd.motor_cmd[i].dq = 0.0;
-                low_cmd.motor_cmd[i].tau = current_tau_est_[i];
+                low_cmd.motor_cmd[i].tau = 0.0;
                 low_cmd.motor_cmd[i].kp = GetMotorKp(G1MotorType[i]);
                 low_cmd.motor_cmd[i].kd = GetMotorKd(G1MotorType[i]);
             }
