@@ -2,7 +2,7 @@
  * A ROS 2 Node to safely lock all 29 joints of the Unitree G1 at the Home (0.0) position.
  * Uses exact physical motor gain mapping and 3-second interpolation for safety.
  **/
-#include "g1_custom_control/motor_crc_hg.h"
+#include "g1/motor_crc_hg.h"
 #include "rclcpp/rclcpp.hpp"
 #include "unitree_hg/msg/low_cmd.hpp"
 #include "unitree_hg/msg/low_state.hpp"

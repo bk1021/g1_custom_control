@@ -12,6 +12,7 @@ find_package(rclcpp_action REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(unitree_hg REQUIRED)
+find_package(unitree_api REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 
 # Add the executable
@@ -25,9 +26,10 @@ ament_target_dependencies(g1_homing_node rclcpp unitree_hg)
 add_executable(g1_moveit_bridge src/g1_moveit_bridge.cpp src/motor_crc_hg.cpp)
 target_include_directories(g1_moveit_bridge PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/g1>
   $<INSTALL_INTERFACE:include>)
 target_compile_features(g1_moveit_bridge PUBLIC c_std_99 cxx_std_17)
-ament_target_dependencies(g1_moveit_bridge rclcpp rclcpp_action sensor_msgs control_msgs unitree_hg)
+ament_target_dependencies(g1_moveit_bridge rclcpp rclcpp_action sensor_msgs control_msgs unitree_hg unitree_api)
 
 add_executable(g1_ik_demo src/g1_ik_demo.cpp)
 target_compile_features(g1_ik_demo PUBLIC c_std_99 cxx_std_17)

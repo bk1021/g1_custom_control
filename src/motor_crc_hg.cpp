@@ -1,4 +1,4 @@
-#include "g1_custom_control/motor_crc_hg.h"
+#include "g1/motor_crc_hg.h"
 
 void get_crc(unitree_hg::msg::LowCmd &msg) {
   LowCmd raw{};

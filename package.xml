@@ -10,7 +10,11 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>sensor_msgs</depend>
+  <depend>control_msgs</depend>
   <depend>unitree_hg</depend>
+  <depend>unitree_api</depend>
   <depend>moveit_ros_planning_interface</depend>
   <depend>geometry_msgs</depend>
 
