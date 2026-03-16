@@ -72,59 +72,70 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_moveit_bridge")
     }
 
     msclient_ = std::make_shared<unitree::robot::g1::MotionSwitchClient>(this);
-    int retries = 0;
-    while (queryMotionStatus() != 0) 
-    {
-        if (++retries > 10) throw std::runtime_error("Failed to release motion mode after 10 attempts");
-        std::cout << "Try to deactivate the motion control-related service." << std::endl;
-        int32_t ret = msclient_->ReleaseMode();
-        if (ret == 0) {
-            std::cout << "ReleaseMode succeeded." << std::endl;
-        } 
-        else {
-            std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
+
+    // Defer motion switcher check and ROS interface creation to a background
+    // thread so that the executor is already spinning when BaseClient::Call()
+    // publishes a request and waits for a subscription callback.
+    init_thread_ = std::thread([this]() {
+        std::this_thread::sleep_for(1s);
+
+        int retries = 0;
+        while (queryMotionStatus() != 0) 
+        {
+            if (++retries > 10) {
+                RCLCPP_FATAL(this->get_logger(), "Failed to release motion mode after 10 attempts");
+                return;
+            }
+            std::cout << "Try to deactivate the motion control-related service." << std::endl;
+            int32_t ret = msclient_->ReleaseMode();
+            if (ret == 0) {
+                std::cout << "ReleaseMode succeeded." << std::endl;
+            } 
+            else {
+                std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
+            }
+            std::this_thread::sleep_for(2s);
         }
-        std::this_thread::sleep_for(2s);
-    }
 
-    lowstate_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    command_writer_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    control_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        lowstate_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        command_writer_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        control_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-    joint_state_publisher_ = this->create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
+        joint_state_publisher_ = this->create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
 
-    rclcpp::QoS qos_sub(rclcpp::KeepLast(1));
-    qos_sub.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
-    rclcpp::SubscriptionOptions lowstate_sub_options;
-    lowstate_sub_options.callback_group = lowstate_callback_group_;
-    lowstate_subscriber_ = this->create_subscription<unitree_hg::msg::LowState>(
-        "lowstate", qos_sub, std::bind(&G1MoveItBridge::lowstate_callback, this, std::placeholders::_1), lowstate_sub_options);
+        rclcpp::QoS qos_sub(rclcpp::KeepLast(1));
+        qos_sub.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+        rclcpp::SubscriptionOptions lowstate_sub_options;
+        lowstate_sub_options.callback_group = lowstate_callback_group_;
+        lowstate_subscriber_ = this->create_subscription<unitree_hg::msg::LowState>(
+            "lowstate", qos_sub, std::bind(&G1MoveItBridge::lowstate_callback, this, std::placeholders::_1), lowstate_sub_options);
 
-    rclcpp::QoS qos_pub(rclcpp::KeepLast(1));
-    qos_pub.reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
-    lowcmd_publisher_ = this->create_publisher<unitree_hg::msg::LowCmd>("lowcmd", qos_pub);
-    command_writer_timer_ = this->create_wall_timer(
-        kControlPeriod,
-        std::bind(&G1MoveItBridge::command_writer_loop, this),
-        command_writer_callback_group_);
-    control_timer_ = this->create_wall_timer(
-        kControlPeriod,
-        std::bind(&G1MoveItBridge::control_loop, this),
-        control_callback_group_);
+        rclcpp::QoS qos_pub(rclcpp::KeepLast(1));
+        qos_pub.reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
+        lowcmd_publisher_ = this->create_publisher<unitree_hg::msg::LowCmd>("lowcmd", qos_pub);
+        command_writer_timer_ = this->create_wall_timer(
+            kControlPeriod,
+            std::bind(&G1MoveItBridge::command_writer_loop, this),
+            command_writer_callback_group_);
+        control_timer_ = this->create_wall_timer(
+            kControlPeriod,
+            std::bind(&G1MoveItBridge::control_loop, this),
+            control_callback_group_);
 
-    left_arm_action_server_ = rclcpp_action::create_server<FollowJointTrajectory>(
-        this, "left_arm_controller/follow_joint_trajectory",
-        std::bind(&G1MoveItBridge::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&G1MoveItBridge::handle_cancel, this, std::placeholders::_1),
-        std::bind(&G1MoveItBridge::handle_accepted, this, std::placeholders::_1));
+        left_arm_action_server_ = rclcpp_action::create_server<FollowJointTrajectory>(
+            this, "left_arm_controller/follow_joint_trajectory",
+            std::bind(&G1MoveItBridge::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&G1MoveItBridge::handle_cancel, this, std::placeholders::_1),
+            std::bind(&G1MoveItBridge::handle_accepted, this, std::placeholders::_1));
 
-    right_arm_action_server_ = rclcpp_action::create_server<FollowJointTrajectory>(
-        this, "right_arm_controller/follow_joint_trajectory",
-        std::bind(&G1MoveItBridge::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&G1MoveItBridge::handle_cancel, this, std::placeholders::_1),
-        std::bind(&G1MoveItBridge::handle_accepted, this, std::placeholders::_1));
+        right_arm_action_server_ = rclcpp_action::create_server<FollowJointTrajectory>(
+            this, "right_arm_controller/follow_joint_trajectory",
+            std::bind(&G1MoveItBridge::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&G1MoveItBridge::handle_cancel, this, std::placeholders::_1),
+            std::bind(&G1MoveItBridge::handle_accepted, this, std::placeholders::_1));
 
-    RCLCPP_INFO(this->get_logger(), "MoveIt to Unitree LowCmd Bridge Started!");
+        RCLCPP_INFO(this->get_logger(), "MoveIt to Unitree LowCmd Bridge Started!");
+    });
 }
 
 void G1MoveItBridge::lowstate_callback(const unitree_hg::msg::LowState::SharedPtr msg)
@@ -152,6 +163,7 @@ void G1MoveItBridge::lowstate_callback(const unitree_hg::msg::LowState::SharedPt
 
     if (capture_initial_state) {
         initial_q_captured_.store(true, std::memory_order_release);
+        RCLCPP_INFO(this->get_logger(), "Initial joint state captured. Start homing all joints to zero...");
 
         MotorCommand init_cmd;
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
@@ -217,21 +229,37 @@ void G1MoveItBridge::command_writer_loop()
             shutdown_homing_step_.store(step + 1, std::memory_order_release);
         }
     } else {
-        run_trajectory_state_machine(this->now(), command);
-
-        if (homing_ratio_ < 1.0) {
-            homing_ratio_ += (1.0 / static_cast<double>(kHomingSteps));
-            if (homing_ratio_ > 1.0) homing_ratio_ = 1.0;
-        }
-
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
             command.kp[i] = motor_kp_[i];
             command.kd[i] = motor_kd_[i];
             command.tau_ff[i] = 0.0f;
         }
-        for (int i = 0; i < 15; ++i) {
-            command.q_target[i] = static_cast<float>(initial_q_[i] * (1.0 - homing_ratio_));
-            command.dq_target[i] = 0.0f;
+
+        if (startup_homing_ratio_ < 1.0) {
+            // Startup homing: blend ALL joints from initial position to zero.
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                command.q_target[i] = static_cast<float>(initial_q_[i] * (1.0 - startup_homing_ratio_));
+                command.dq_target[i] = 0.0f;
+            }
+            startup_homing_ratio_ += (1.0 / static_cast<double>(kHomingSteps));
+            if (startup_homing_ratio_ > 1.0) startup_homing_ratio_ = 1.0;
+        } else if (!startup_homing_done_.load(std::memory_order_acquire)) {
+            // Final tick: clamp all joints to exact zero and mark done.
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                command.q_target[i] = 0.0f;
+                command.dq_target[i] = 0.0f;
+            }
+            startup_homing_done_.store(true, std::memory_order_release);
+            RCLCPP_INFO(this->get_logger(), "Startup homing complete. All joints at zero. Ready for trajectories.");
+        } else {
+            // Normal operation: trajectory state machine drives arms,
+            // lower body stays pinned to zero.
+            run_trajectory_state_machine(this->now(), command);
+
+            for (int i = 0; i < 15; ++i) {
+                command.q_target[i] = 0.0f;
+                command.dq_target[i] = 0.0f;
+            }
         }
 
         if (IsCommandChanged(previous_command, command)) {
@@ -299,6 +327,10 @@ rclcpp_action::GoalResponse G1MoveItBridge::handle_goal(
 {
     if (!initial_q_captured_.load(std::memory_order_acquire)) {
         RCLCPP_WARN(this->get_logger(), "Rejecting goal: no robot state received yet.");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+    if (!startup_homing_done_.load(std::memory_order_acquire)) {
+        RCLCPP_WARN(this->get_logger(), "Rejecting goal: startup homing to zero posture still in progress.");
         return rclcpp_action::GoalResponse::REJECT;
     }
     if (shutdown_requested_.load()) {
@@ -799,7 +831,7 @@ void G1MoveItBridge::perform_shutdown_homing()
         low_cmd.mode_pr = mode_pr_;
         low_cmd.mode_machine = mode_machine_.load(std::memory_order_relaxed);
 
-        for (int step = 0; step < kHomingSteps; ++step) {
+        for (int step = 0; step <= kHomingSteps; ++step) {
             const double ratio = static_cast<double>(step) / static_cast<double>(kHomingSteps);
             for (int i = 0; i < G1_NUM_MOTOR; ++i) {
                 low_cmd.motor_cmd[i].mode = 0x01;
@@ -821,6 +853,9 @@ void G1MoveItBridge::perform_shutdown_homing()
 
 G1MoveItBridge::~G1MoveItBridge() 
 {
+    if (init_thread_.joinable()) {
+        init_thread_.join();
+    }
     perform_shutdown_homing();
 }
 

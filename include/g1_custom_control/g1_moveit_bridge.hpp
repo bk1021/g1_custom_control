@@ -170,10 +170,13 @@ private:
     rclcpp_action::Server<FollowJointTrajectory>::SharedPtr right_arm_action_server_;
 
     std::shared_ptr<unitree::robot::g1::MotionSwitchClient> msclient_;
+    std::thread init_thread_;
     std::array<float, G1_NUM_MOTOR> initial_q_{0};
     std::array<float, G1_NUM_MOTOR> motor_kp_{0};
     std::array<float, G1_NUM_MOTOR> motor_kd_{0};
-    double homing_ratio_ = 0.0;
+    
+    double startup_homing_ratio_ = 0.0;
+    std::atomic<bool> startup_homing_done_{false};
 
     DataBuffer<MotorState> motor_state_buffer_;
     DataBuffer<MotorCommand> motor_command_buffer_;
