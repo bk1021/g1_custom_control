@@ -2,6 +2,7 @@
 #include "g1/motor_crc_hg.h"
 #include "g1/g1_motion_switch_client.hpp"
 #include "moveit/move_group_interface/move_group_interface.h"
+#include "rclcpp/parameter_client.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
 #include <algorithm>
 #include <csignal>
@@ -55,8 +56,10 @@ enum class EvalPhase {
     kWaitAfterHoming,
     kRequestMoveIt,
     kWaitMoveItDone,
+    kWaitAfterRelax,
     kRequestReturnHome,
     kWaitReturnHomeDone,
+    kWaitAfterReturnHome,
     kRequestShutdown,
     kDone,
 };
@@ -67,6 +70,8 @@ struct EvalRuntime {
     rclcpp::Time phase_start{0, 0, RCL_ROS_TIME};
 
     double wait_after_homing_sec = 5.0;
+    double wait_after_relax_sec = 5.0;
+    double wait_after_return_home_sec = 5.0;
     double settle_before_shutdown_sec = 0.5;
 
     std::string move_group_name{"left_arm"};
@@ -126,10 +131,14 @@ const char *eval_phase_name(EvalPhase phase)
         return "request_moveit_plan";
     case EvalPhase::kWaitMoveItDone:
         return "wait_moveit_done";
+    case EvalPhase::kWaitAfterRelax:
+        return "wait_after_relax";
     case EvalPhase::kRequestReturnHome:
         return "request_return_home";
     case EvalPhase::kWaitReturnHomeDone:
         return "wait_return_home_done";
+    case EvalPhase::kWaitAfterReturnHome:
+        return "wait_after_return_home";
     case EvalPhase::kRequestShutdown:
         return "request_shutdown";
     case EvalPhase::kDone:
@@ -177,6 +186,60 @@ void sigint_handler(int)
 {
     g_sigint_requested.store(true, std::memory_order_relaxed);
 }
+
+bool ensure_moveit_descriptions(const std::shared_ptr<rclcpp::Node> &node)
+{
+    auto has_non_empty = [&](const std::string &name) {
+        std::string val;
+        if (!node->get_parameter(name, val)) {
+            return false;
+        }
+        return !val.empty();
+    };
+
+    if (has_non_empty("robot_description") && has_non_empty("robot_description_semantic")) {
+        return true;
+    }
+
+    auto param_client = std::make_shared<rclcpp::AsyncParametersClient>(node, "/move_group");
+    if (!param_client->wait_for_service(std::chrono::seconds(3))) {
+        RCLCPP_ERROR(node->get_logger(), "Could not reach /move_group parameter service.");
+        return false;
+    }
+
+    std::vector<rclcpp::Parameter> params;
+    try {
+        auto future = param_client->get_parameters({"robot_description", "robot_description_semantic"});
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            RCLCPP_ERROR(node->get_logger(), "Timed out while waiting for MoveIt description parameters from /move_group.");
+            return false;
+        }
+        params = future.get();
+    } catch (const std::exception &e) {
+        RCLCPP_ERROR(node->get_logger(), "Failed to query MoveIt description parameters: %s", e.what());
+        return false;
+    }
+
+    std::string urdf;
+    std::string srdf;
+    for (const auto &p : params) {
+        if (p.get_name() == "robot_description" && p.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
+            urdf = p.as_string();
+        }
+        if (p.get_name() == "robot_description_semantic" && p.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
+            srdf = p.as_string();
+        }
+    }
+
+    if (urdf.empty() || srdf.empty()) {
+        RCLCPP_ERROR(node->get_logger(), "MoveIt robot_description or robot_description_semantic is empty on /move_group.");
+        return false;
+    }
+
+    node->set_parameter(rclcpp::Parameter("robot_description", urdf));
+    node->set_parameter(rclcpp::Parameter("robot_description_semantic", srdf));
+    return true;
+}
 } // namespace
 
 namespace g1_custom_control {
@@ -222,7 +285,7 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_evaluate")
     g_eval_config.mode = parse_eval_mode(mode_name);
     g_eval_config.mode_name = mode_name;
     g_eval_config.enabled = this->declare_parameter<bool>("collect_data", true);
-    g_eval_config.decimation = std::max(1, this->declare_parameter<int>("collect_every_n", 5));
+    g_eval_config.decimation = static_cast<int>(std::max(1L, this->declare_parameter<int>("collect_every_n", 5)));
     g_eval_config.run_label = this->declare_parameter<std::string>("run_label", "default");
 
     g_eval_runtime.wait_after_homing_sec = this->declare_parameter<double>("wait_after_homing_sec", 5.0);
@@ -232,6 +295,8 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_evaluate")
     g_eval_runtime.move_group_name = g_eval_runtime.eval_arm + "_arm";
     g_eval_runtime.named_target = g_eval_runtime.eval_arm + "_arm_relax";
     g_eval_runtime.planning_time_sec = this->declare_parameter<double>("planning_time_sec", 5.0);
+    this->declare_parameter<std::string>("robot_description", "");
+    this->declare_parameter<std::string>("robot_description_semantic", "");
 
     const std::string default_csv = make_default_csv_name(g_eval_runtime.eval_arm);
     g_eval_config.csv_path = this->declare_parameter<std::string>("csv_path", default_csv);
@@ -480,6 +545,12 @@ void G1MoveItBridge::command_writer_loop()
             // startup homing -> wait -> for each mode: relax -> return home -> shutdown homing.
             const auto now = this->now();
             for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                // Keep last position target as hold command between phases.
+                command.dq_target[i] = 0.0f;
+            }
+
+            // Keep lower-body joints fixed at zero throughout evaluation.
+            for (int i = 0; i < 15 && i < G1_NUM_MOTOR; ++i) {
                 command.q_target[i] = 0.0f;
                 command.dq_target[i] = 0.0f;
             }
@@ -523,8 +594,23 @@ void G1MoveItBridge::command_writer_loop()
                     std::thread([this]() {
                         bool ok = false;
                         try {
+                            auto self = std::dynamic_pointer_cast<rclcpp::Node>(shared_from_this());
+                            if (!self) {
+                                RCLCPP_ERROR(this->get_logger(), "Failed to get shared node pointer for MoveIt request.");
+                                g_eval_runtime.moveit_request_success.store(false, std::memory_order_release);
+                                g_eval_runtime.moveit_request_done.store(true, std::memory_order_release);
+                                return;
+                            }
+
+                            if (!ensure_moveit_descriptions(self)) {
+                                RCLCPP_ERROR(this->get_logger(), "MoveIt descriptions are unavailable; skipping planning request.");
+                                g_eval_runtime.moveit_request_success.store(false, std::memory_order_release);
+                                g_eval_runtime.moveit_request_done.store(true, std::memory_order_release);
+                                return;
+                            }
+
                             auto move_group = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
-                                shared_from_this(),
+                                self,
                                 g_eval_runtime.move_group_name);
                             move_group->setPlanningTime(g_eval_runtime.planning_time_sec);
                             move_group->setStartStateToCurrentState();
@@ -564,13 +650,25 @@ void G1MoveItBridge::command_writer_loop()
                     RCLCPP_INFO(this->get_logger(), "Evaluation phase: %s", eval_phase_name(g_eval_runtime.phase));
                 }
 
+                // During MoveIt execute(), this node's action server must keep generating
+                // joint commands from the accepted FollowJointTrajectory goal.
+                run_trajectory_state_machine(now, command);
+
+                bool trajectory_still_active = false;
+                {
+                    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+                    trajectory_still_active = trajectory_rt_.active;
+                }
+
                 if (g_eval_runtime.moveit_request_done.load(std::memory_order_acquire)) {
                     if (g_eval_runtime.moveit_request_success.load(std::memory_order_acquire)) {
-                        g_eval_runtime.moveit_request_started.store(false, std::memory_order_release);
-                        g_eval_runtime.moveit_request_done.store(false, std::memory_order_release);
-                        g_eval_runtime.moveit_request_success.store(false, std::memory_order_release);
-                        g_eval_runtime.phase = EvalPhase::kRequestReturnHome;
-                        g_eval_runtime.phase_started = false;
+                        if (!trajectory_still_active) {
+                            g_eval_runtime.moveit_request_started.store(false, std::memory_order_release);
+                            g_eval_runtime.moveit_request_done.store(false, std::memory_order_release);
+                            g_eval_runtime.moveit_request_success.store(false, std::memory_order_release);
+                            g_eval_runtime.phase = EvalPhase::kWaitAfterRelax;
+                            g_eval_runtime.phase_started = false;
+                        }
                     } else {
                         RCLCPP_ERROR(this->get_logger(), "MoveIt planning/execution failed. Requesting shutdown homing.");
                         request_shutdown_homing();
@@ -578,11 +676,32 @@ void G1MoveItBridge::command_writer_loop()
                         g_eval_runtime.phase_started = false;
                     }
                 }
+            } else if (g_eval_runtime.phase == EvalPhase::kWaitAfterRelax) {
+                if (!g_eval_runtime.phase_started) {
+                    g_eval_runtime.phase_started = true;
+                    g_eval_runtime.phase_start = now;
+                    RCLCPP_INFO(this->get_logger(), "Evaluation phase: %s", eval_phase_name(g_eval_runtime.phase));
+                }
+
+                if ((now - g_eval_runtime.phase_start).seconds() >= g_eval_runtime.wait_after_relax_sec) {
+                    g_eval_runtime.phase = EvalPhase::kRequestReturnHome;
+                    g_eval_runtime.phase_started = false;
+                }
             } else if (g_eval_runtime.phase == EvalPhase::kRequestReturnHome) {
                 if (!g_eval_runtime.phase_started) {
                     g_eval_runtime.phase_started = true;
                     g_eval_runtime.phase_start = now;
                     RCLCPP_INFO(this->get_logger(), "Evaluation phase: %s", eval_phase_name(g_eval_runtime.phase));
+
+                    // Safety gate: return-home must own the arm command path.
+                    {
+                        std::lock_guard<std::mutex> lock(trajectory_mutex_);
+                        if (trajectory_rt_.active) {
+                            trajectory_rt_ = TrajectoryRuntime{};
+                            RCLCPP_WARN(this->get_logger(), "Cleared stale trajectory runtime before return-home.");
+                        }
+                    }
+
                     if (auto state_snapshot = motor_state_buffer_.GetData()) {
                         for (int j = 0; j < 7; ++j) {
                             g_eval_runtime.return_home_start_q[j] = state_snapshot->q[g_eval_runtime.arm_start_idx + j];
@@ -592,6 +711,14 @@ void G1MoveItBridge::command_writer_loop()
                             g_eval_runtime.return_home_start_q[j] = command.q_target[g_eval_runtime.arm_start_idx + j];
                         }
                     }
+
+                    // Hold the captured start pose on the transition tick to
+                    // avoid a one-cycle jump to zero before interpolation starts.
+                    for (int j = 0; j < 7; ++j) {
+                        const int motor_id = g_eval_runtime.arm_start_idx + j;
+                        command.q_target[motor_id] = g_eval_runtime.return_home_start_q[j];
+                        command.dq_target[motor_id] = 0.0f;
+                    }
                 }
                 g_eval_runtime.phase = EvalPhase::kWaitReturnHomeDone;
                 g_eval_runtime.phase_started = false;
@@ -600,6 +727,20 @@ void G1MoveItBridge::command_writer_loop()
                     g_eval_runtime.phase_started = true;
                     g_eval_runtime.phase_start = now;
                     RCLCPP_INFO(this->get_logger(), "Evaluation phase: %s", eval_phase_name(g_eval_runtime.phase));
+                }
+
+                // Return-home owns arm commands; clear any late trajectory runtime
+                // callback that could reintroduce relax-target commands.
+                {
+                    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+                    if (trajectory_rt_.active) {
+                        trajectory_rt_ = TrajectoryRuntime{};
+                        RCLCPP_WARN_THROTTLE(
+                            this->get_logger(),
+                            *this->get_clock(),
+                            1000,
+                            "Cleared late trajectory runtime during return-home.");
+                    }
                 }
 
                 const double elapsed = (now - g_eval_runtime.phase_start).seconds();
@@ -616,6 +757,17 @@ void G1MoveItBridge::command_writer_loop()
 
                 if (elapsed >= return_home_duration_sec) {
                     g_eval_runtime.mode_index += 1;
+                    g_eval_runtime.phase = EvalPhase::kWaitAfterReturnHome;
+                    g_eval_runtime.phase_started = false;
+                }
+            } else if (g_eval_runtime.phase == EvalPhase::kWaitAfterReturnHome) {
+                if (!g_eval_runtime.phase_started) {
+                    g_eval_runtime.phase_started = true;
+                    g_eval_runtime.phase_start = now;
+                    RCLCPP_INFO(this->get_logger(), "Evaluation phase: %s", eval_phase_name(g_eval_runtime.phase));
+                }
+
+                if ((now - g_eval_runtime.phase_start).seconds() >= g_eval_runtime.wait_after_return_home_sec) {
                     if (g_eval_runtime.mode_index >= static_cast<int>(kAutoEvalModes.size())) {
                         g_eval_runtime.phase = EvalPhase::kRequestShutdown;
                     } else {
@@ -737,6 +889,16 @@ rclcpp_action::GoalResponse G1MoveItBridge::handle_goal(
     }
     if (shutdown_requested_.load()) {
         RCLCPP_WARN(this->get_logger(), "Rejecting trajectory goal: node is shutting down.");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    // Only allow action goals during the explicit MoveIt execute window.
+    if (g_eval_runtime.phase != EvalPhase::kWaitMoveItDone ||
+        !g_eval_runtime.moveit_request_started.load(std::memory_order_acquire)) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Rejecting trajectory goal: outside relax execution window (phase=%s).",
+            eval_phase_name(g_eval_runtime.phase));
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -1153,6 +1315,15 @@ void G1MoveItBridge::run_trajectory_state_machine(const rclcpp::Time &now, Motor
                 }
             }
         }
+    } else {
+        // Keep commanding the final waypoint during settle/physics-check so
+        // the arm does not get overwritten by outer-loop zero targets.
+        const auto &final_point = traj.points.back();
+        for (size_t j = 0; j < mapped_indices.size(); ++j) {
+            const int motor_id = mapped_indices[j];
+            command.q_target[motor_id] = final_point.positions[j];
+            command.dq_target[motor_id] = 0.0f;
+        }
     }
 
     const bool about_to_finish = settle_phase && 
@@ -1286,7 +1457,9 @@ int main(int argc, char **argv)
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
     executor.add_node(node);
 
-    while (rclcpp::ok() && !g_sigint_requested.load(std::memory_order_relaxed)) {
+    while (rclcpp::ok() &&
+           !g_sigint_requested.load(std::memory_order_relaxed) &&
+           !node->is_shutdown_homing_done()) {
         executor.spin_some(2ms);
     }
 
