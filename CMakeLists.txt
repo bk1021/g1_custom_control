@@ -31,6 +31,14 @@ target_include_directories(g1_moveit_bridge PUBLIC
 target_compile_features(g1_moveit_bridge PUBLIC c_std_99 cxx_std_17)
 ament_target_dependencies(g1_moveit_bridge rclcpp rclcpp_action sensor_msgs control_msgs unitree_hg unitree_api)
 
+add_executable(g1_evaluate src/g1_evaluate.cpp src/motor_crc_hg.cpp)
+target_include_directories(g1_evaluate PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/g1>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(g1_evaluate PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(g1_evaluate rclcpp rclcpp_action sensor_msgs control_msgs unitree_hg unitree_api moveit_ros_planning_interface)
+
 add_executable(g1_ik_demo src/g1_ik_demo.cpp)
 target_compile_features(g1_ik_demo PUBLIC c_std_99 cxx_std_17)
 ament_target_dependencies(g1_ik_demo 
@@ -42,6 +50,7 @@ ament_target_dependencies(g1_ik_demo
 install(TARGETS 
   g1_homing_node
   g1_moveit_bridge
+  g1_evaluate
   g1_ik_demo
   DESTINATION lib/${PROJECT_NAME}
 )
