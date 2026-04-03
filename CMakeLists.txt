@@ -47,11 +47,36 @@ ament_target_dependencies(g1_ik_demo
   geometry_msgs
 )
 
+add_executable(custom_loco_movement src/custom_loco_movement.cpp)
+target_include_directories(custom_loco_movement PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/g1>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/g1/common>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/g1/nlohmann>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(custom_loco_movement PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(custom_loco_movement
+  rclcpp
+  unitree_hg
+  unitree_api
+)
+
 install(TARGETS 
   g1_homing_node
   g1_moveit_bridge
   g1_evaluate
   g1_ik_demo
+  custom_loco_movement
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY launch config
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  PROGRAMS scripts/joy_to_servo_mapper.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
