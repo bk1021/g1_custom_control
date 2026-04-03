@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <g1/g1_loco_client.hpp>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 #include <thread>
@@ -12,6 +14,7 @@
 #include <unistd.h>
 
 #include <unitree_hg/msg/low_cmd.hpp>
+#include <unitree_hg/msg/low_state.hpp>
 
 using namespace std::chrono_literals;
 
@@ -24,6 +27,7 @@ constexpr int kWaistLastJoint = 14;
 constexpr int kArmSdkFirstJoint = 12;
 constexpr int kArmSdkLastJoint = 28;
 constexpr int kArmSdkWeightJoint = 29;
+constexpr int kArmSdkStateBufferSize = kArmSdkWeightJoint + 1;
 
 constexpr bool is_waist_joint(const int idx)
 {
@@ -53,6 +57,15 @@ public:
     qos_pub.best_effort();
     arm_sdk_publisher_ = this->create_publisher<unitree_hg::msg::LowCmd>("arm_sdk", qos_pub);
 
+    rclcpp::QoS qos_sub(rclcpp::KeepLast(1));
+    qos_sub.best_effort();
+    lowstate_subscriber_ = this->create_subscription<unitree_hg::msg::LowState>(
+      "/lowstate",
+      qos_sub,
+      [this](const unitree_hg::msg::LowState::SharedPtr msg) {
+        lowstate_callback(msg);
+      });
+
     arm_home_thread_ = std::thread([this]() {
       arm_home_loop();
     });
@@ -60,11 +73,15 @@ public:
     worker_thread_ = std::thread([this]() {
       std::this_thread::sleep_for(1s);
 
-      RCLCPP_INFO(
-        this->get_logger(),
-        "Homing arms on /arm_sdk for %.2f s before sequence startup...",
-        arm_home_startup_s_);
-      sleep_seconds(arm_home_startup_s_);
+      RCLCPP_INFO(this->get_logger(), "Waiting for startup arm homing to complete...");
+      while (rclcpp::ok() && keep_arm_home_.load(std::memory_order_acquire) &&
+             !startup_homing_done_.load(std::memory_order_acquire)) {
+        sleep_seconds(0.05);
+      }
+
+      if (!rclcpp::ok() || !keep_arm_home_.load(std::memory_order_acquire)) {
+        return;
+      }
 
       if (!wait_for_enter()) {
         return;
@@ -129,7 +146,49 @@ private:
     return false;
   }
 
-  void publish_arm_home_command(const float control_weight)
+  void lowstate_callback(const unitree_hg::msg::LowState::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(lowstate_mutex_);
+    for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+      latest_arm_joint_q_[i] = msg->motor_state[i].q;
+    }
+    has_lowstate_.store(true, std::memory_order_release);
+  }
+
+  bool wait_for_lowstate(const double timeout_s) const
+  {
+    if (has_lowstate_.load(std::memory_order_acquire)) {
+      return true;
+    }
+
+    const auto start_time = std::chrono::steady_clock::now();
+    while (rclcpp::ok() && keep_arm_home_.load(std::memory_order_acquire)) {
+      if (has_lowstate_.load(std::memory_order_acquire)) {
+        return true;
+      }
+
+      const auto elapsed_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time)
+                               .count();
+      if (elapsed_s >= timeout_s) {
+        return false;
+      }
+
+      sleep_seconds(0.01);
+    }
+
+    return false;
+  }
+
+  std::array<float, kArmSdkStateBufferSize> snapshot_current_arm_q() const
+  {
+    std::lock_guard<std::mutex> lock(lowstate_mutex_);
+    return latest_arm_joint_q_;
+  }
+
+  void publish_arm_home_command(
+    const std::array<float, kArmSdkStateBufferSize> &target_q,
+    const float control_weight)
   {
     if (!arm_sdk_publisher_) {
       return;
@@ -137,7 +196,7 @@ private:
 
     unitree_hg::msg::LowCmd arm_cmd;
     for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
-      arm_cmd.motor_cmd[i].q = 0.0F;
+      arm_cmd.motor_cmd[i].q = target_q[i];
       arm_cmd.motor_cmd[i].dq = 0.0F;
       arm_cmd.motor_cmd[i].tau = 0.0F;
       arm_cmd.motor_cmd[i].kp = is_waist_joint(i)
@@ -153,8 +212,63 @@ private:
     arm_sdk_publisher_->publish(arm_cmd);
   }
 
+  void publish_arm_home_command(const float control_weight)
+  {
+    publish_arm_home_command(home_arm_joint_q_, control_weight);
+  }
+
+  void run_startup_arm_homing()
+  {
+    const float control_weight = current_control_weight_.load(std::memory_order_relaxed);
+
+    if (arm_home_startup_s_ <= 0.0) {
+      publish_arm_home_command(control_weight);
+      return;
+    }
+
+    if (!wait_for_lowstate(std::max(2.0, arm_home_startup_s_))) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "No /lowstate received in time. Falling back to immediate arm home hold.");
+      publish_arm_home_command(control_weight);
+      return;
+    }
+
+    const auto start_q = snapshot_current_arm_q();
+    const double period_s = std::max(0.001, arm_home_publish_period_s_);
+    const int homing_steps = std::max(1, static_cast<int>(arm_home_startup_s_ / period_s));
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Interpolating arms to home over %.2f s (%d steps).",
+      arm_home_startup_s_,
+      homing_steps);
+
+    for (int step = 0; step <= homing_steps; ++step) {
+      if (!rclcpp::ok() || !keep_arm_home_.load(std::memory_order_acquire)) {
+        return;
+      }
+
+      const float ratio = static_cast<float>(step) / static_cast<float>(homing_steps);
+      std::array<float, kArmSdkStateBufferSize> target_q = home_arm_joint_q_;
+
+      for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+        target_q[i] = start_q[i] * (1.0F - ratio);
+      }
+
+      publish_arm_home_command(target_q, control_weight);
+
+      if (step < homing_steps) {
+        sleep_seconds(period_s);
+      }
+    }
+  }
+
   void arm_home_loop()
   {
+    run_startup_arm_homing();
+    startup_homing_done_.store(true, std::memory_order_release);
+
     while (rclcpp::ok() && keep_arm_home_.load(std::memory_order_acquire)) {
       publish_arm_home_command(current_control_weight_.load(std::memory_order_relaxed));
       sleep_seconds(arm_home_publish_period_s_);
@@ -254,10 +368,16 @@ private:
 
   unitree::robot::g1::LocoClient loco_client_;
   rclcpp::Publisher<unitree_hg::msg::LowCmd>::SharedPtr arm_sdk_publisher_;
+  rclcpp::Subscription<unitree_hg::msg::LowState>::SharedPtr lowstate_subscriber_;
 
   std::atomic<bool> keep_arm_home_{true};
+  std::atomic<bool> has_lowstate_{false};
+  std::atomic<bool> startup_homing_done_{false};
   std::atomic<bool> shutdown_requested_{false};
   std::atomic<float> current_control_weight_{1.0F};
+  mutable std::mutex lowstate_mutex_;
+  std::array<float, kArmSdkStateBufferSize> latest_arm_joint_q_{};
+  const std::array<float, kArmSdkStateBufferSize> home_arm_joint_q_{};
   std::thread arm_home_thread_;
   std::thread worker_thread_;
 
