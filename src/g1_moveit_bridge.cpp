@@ -19,7 +19,8 @@ constexpr auto kLowCmdControlPeriod = 2ms;
 constexpr auto kArmSdkControlPeriod = 20ms;
 constexpr int kLowCmdHomingSteps = 1000;
 constexpr int kArmSdkHomingSteps = 100;
-constexpr double kLoopOverrunThresholdMs = 2.2;
+constexpr double kLowCmdLoopOverrunThresholdMs = 2.2;
+constexpr double kArmSdkLoopOverrunThresholdMs = 21.0;
 constexpr double kOnePointFallbackDurationSec = 0.2;
 constexpr double kSettleDurationSec = 0.5;
 constexpr double kGoalToleranceRad = 0.10;
@@ -33,19 +34,16 @@ constexpr int kArmSdkLastJoint = 28;
 constexpr int kArmSdkWeightJoint = 29;
 
 constexpr bool is_waist_joint(const int idx)
-{
-    return idx >= kWaistFirstJoint && idx <= kWaistLastJoint;
-}
+{ return idx >= kWaistFirstJoint && idx <= kWaistLastJoint; }
 
 constexpr int homing_steps_for_mode(const bool use_arm_sdk)
-{
-    return use_arm_sdk ? kArmSdkHomingSteps : kLowCmdHomingSteps;
-}
+{ return use_arm_sdk ? kArmSdkHomingSteps : kLowCmdHomingSteps; }
 
 constexpr auto control_period_for_mode(const bool use_arm_sdk)
-{
-    return use_arm_sdk ? kArmSdkControlPeriod : kLowCmdControlPeriod;
-}
+{ return use_arm_sdk ? kArmSdkControlPeriod : kLowCmdControlPeriod; }
+
+constexpr double loop_overrun_threshold_for_mode(const bool use_arm_sdk)
+{ return use_arm_sdk ? kArmSdkLoopOverrunThresholdMs : kLowCmdLoopOverrunThresholdMs; }
 
 void sigint_handler(int)
 {
@@ -427,14 +425,15 @@ void G1MoveItBridge::command_writer_loop()
         }
     }
 
-    if (loop_period_ms >= 0.0 && loop_period_ms > kLoopOverrunThresholdMs) {
+    const double loop_overrun_threshold_ms = loop_overrun_threshold_for_mode(use_arm_sdk_);
+    if (loop_period_ms >= 0.0 && loop_period_ms > loop_overrun_threshold_ms) {
         RCLCPP_WARN_THROTTLE(
             this->get_logger(),
             *this->get_clock(),
             2000,
             "command_writer_loop period exceeded threshold: %.3f ms > %.3f ms",
             loop_period_ms,
-            kLoopOverrunThresholdMs);
+            loop_overrun_threshold_ms);
     }
 }
 
@@ -475,14 +474,15 @@ void G1MoveItBridge::control_loop()
         lowcmd_publisher_->publish(low_cmd);
     }
 
-    if (loop_period_ms >= 0.0 && loop_period_ms > kLoopOverrunThresholdMs) {
+    const double loop_overrun_threshold_ms = loop_overrun_threshold_for_mode(use_arm_sdk_);
+    if (loop_period_ms >= 0.0 && loop_period_ms > loop_overrun_threshold_ms) {
         RCLCPP_WARN_THROTTLE(
             this->get_logger(),
             *this->get_clock(),
             2000,
             "control_loop period exceeded threshold: %.3f ms > %.3f ms",
             loop_period_ms,
-            kLoopOverrunThresholdMs);
+            loop_overrun_threshold_ms);
     }
 }
 
