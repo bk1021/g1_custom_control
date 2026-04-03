@@ -48,7 +48,6 @@ public:
     arm_home_startup_s_ = this->declare_parameter<double>("arm_home_startup_s", 2.0);
     arm_home_publish_period_s_ = this->declare_parameter<double>("arm_home_publish_period_s", 0.02);
     arm_home_control_weight_ = this->declare_parameter<double>("arm_home_control_weight", 1.0);
-    arm_weight_ramp_down_s_ = this->declare_parameter<double>("arm_weight_ramp_down_s", 2.0);
     current_control_weight_.store(
       std::clamp(static_cast<float>(arm_home_control_weight_), 0.0F, 1.0F),
       std::memory_order_relaxed);
@@ -275,35 +274,6 @@ private:
     }
   }
 
-  void ramp_down_arm_control_weight()
-  {
-    if (!arm_sdk_publisher_) {
-      return;
-    }
-
-    const double period_s = std::max(0.001, arm_home_publish_period_s_);
-    const int ramp_steps = std::max(1, static_cast<int>(arm_weight_ramp_down_s_ / period_s));
-    const float start_weight = std::clamp(
-      current_control_weight_.load(std::memory_order_relaxed),
-      0.0F,
-      1.0F);
-
-    for (int step = 0; step <= ramp_steps; ++step) {
-      const double ratio = static_cast<double>(step) / static_cast<double>(ramp_steps);
-      const float control_weight = std::clamp(
-        static_cast<float>(start_weight * (1.0 - ratio)),
-        0.0F,
-        1.0F);
-
-      current_control_weight_.store(control_weight, std::memory_order_relaxed);
-      publish_arm_home_command(control_weight);
-
-      if (step < ramp_steps) {
-        sleep_seconds(period_s);
-      }
-    }
-  }
-
   void request_shutdown()
   {
     bool expected = false;
@@ -318,7 +288,6 @@ private:
       arm_home_thread_.join();
     }
 
-    ramp_down_arm_control_weight();
     rclcpp::shutdown();
   }
 
@@ -398,7 +367,6 @@ private:
   double arm_home_startup_s_ = 2.0;
   double arm_home_publish_period_s_ = 0.02;
   double arm_home_control_weight_ = 1.0;
-  double arm_weight_ramp_down_s_ = 2.0;
 };
 
 int main(int argc, char **argv)
