@@ -155,6 +155,8 @@ private:
         bool canceled,
         const char *msg);
     void run_trajectory_state_machine(const rclcpp::Time &now, MotorCommand &command);
+    void populate_low_cmd_message(const MotorCommand &command, unitree_hg::msg::LowCmd &low_cmd) const;
+    void populate_arm_sdk_message(const MotorCommand &command, unitree_hg::msg::LowCmd &arm_cmd) const;
 
     // ROS 2 Interfaces
     rclcpp::CallbackGroup::SharedPtr lowstate_callback_group_;
@@ -163,6 +165,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
     rclcpp::Subscription<unitree_hg::msg::LowState>::SharedPtr lowstate_subscriber_;
     rclcpp::Publisher<unitree_hg::msg::LowCmd>::SharedPtr lowcmd_publisher_;
+    rclcpp::Publisher<unitree_hg::msg::LowCmd>::SharedPtr arm_sdk_publisher_;
     rclcpp::TimerBase::SharedPtr command_writer_timer_;
     rclcpp::TimerBase::SharedPtr control_timer_;
     
@@ -174,9 +177,11 @@ private:
     std::array<float, G1_NUM_MOTOR> initial_q_{0};
     std::array<float, G1_NUM_MOTOR> motor_kp_{0};
     std::array<float, G1_NUM_MOTOR> motor_kd_{0};
+    bool use_arm_sdk_ = false;
     
     double startup_homing_ratio_ = 0.0;
     std::atomic<bool> startup_homing_done_{false};
+    std::atomic<float> control_weight_{0.0f};
 
     DataBuffer<MotorState> motor_state_buffer_;
     DataBuffer<MotorCommand> motor_command_buffer_;
@@ -205,6 +210,7 @@ private:
     std::atomic<bool> shutdown_homing_done_{false};
     std::atomic<bool> shutdown_homing_active_{false};
     std::atomic<int> shutdown_homing_step_{0};
+    std::atomic<float> shutdown_homing_start_weight_{0.0f};
     std::mutex shutdown_homing_mutex_;
     std::array<float, G1_NUM_MOTOR> shutdown_homing_start_q_{0};
 

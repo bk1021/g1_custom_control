@@ -3,6 +3,7 @@
 #include "g1/g1_motion_switch_client.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
 #include <algorithm>
+#include <cmath>
 #include <csignal>
 #include <iomanip>
 #include <sstream>
@@ -14,12 +15,37 @@ using namespace std::chrono_literals;
 namespace {
 std::atomic<bool> g_sigint_requested{false};
 
-constexpr auto kControlPeriod = 2ms;
-constexpr int kHomingSteps = 1000;
+constexpr auto kLowCmdControlPeriod = 2ms;
+constexpr auto kArmSdkControlPeriod = 20ms;
+constexpr int kLowCmdHomingSteps = 1000;
+constexpr int kArmSdkHomingSteps = 100;
 constexpr double kLoopOverrunThresholdMs = 2.2;
 constexpr double kOnePointFallbackDurationSec = 0.2;
 constexpr double kSettleDurationSec = 0.5;
 constexpr double kGoalToleranceRad = 0.10;
+constexpr float kArmSdkJointKp = 60.0f;
+constexpr float kArmSdkJointKd = 1.5f;
+constexpr float kArmSdkWaistGainScale = 4.0f;
+constexpr int kWaistFirstJoint = 12;
+constexpr int kWaistLastJoint = 14;
+constexpr int kArmSdkFirstJoint = 12;
+constexpr int kArmSdkLastJoint = 28;
+constexpr int kArmSdkWeightJoint = 29;
+
+constexpr bool is_waist_joint(const int idx)
+{
+    return idx >= kWaistFirstJoint && idx <= kWaistLastJoint;
+}
+
+constexpr int homing_steps_for_mode(const bool use_arm_sdk)
+{
+    return use_arm_sdk ? kArmSdkHomingSteps : kLowCmdHomingSteps;
+}
+
+constexpr auto control_period_for_mode(const bool use_arm_sdk)
+{
+    return use_arm_sdk ? kArmSdkControlPeriod : kLowCmdControlPeriod;
+}
 
 void sigint_handler(int)
 {
@@ -36,7 +62,22 @@ void G1MoveItBridge::request_shutdown_homing()
     }
 
     shutdown_requested_.store(true, std::memory_order_release);
+
+    std::shared_ptr<GoalHandleFJT> active_goal_handle;
+    bool had_active_trajectory = false;
     {
+        std::lock_guard<std::mutex> lock(trajectory_mutex_);
+        had_active_trajectory = trajectory_rt_.active;
+        active_goal_handle = trajectory_rt_.goal_handle;
+    }
+
+    if (had_active_trajectory && active_goal_handle) {
+        finish_trajectory_goal(
+            active_goal_handle,
+            FollowJointTrajectory::Result::INVALID_GOAL,
+            false,
+            "Trajectory aborted: shutdown requested.");
+    } else if (had_active_trajectory) {
         std::lock_guard<std::mutex> lock(trajectory_mutex_);
         trajectory_rt_ = TrajectoryRuntime{};
     }
@@ -53,9 +94,18 @@ void G1MoveItBridge::request_shutdown_homing()
         } else {
             shutdown_homing_start_q_ = initial_q_;
         }
+
+        shutdown_homing_start_weight_.store(
+            control_weight_.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
         shutdown_homing_step_.store(0, std::memory_order_relaxed);
         shutdown_homing_active_.store(true, std::memory_order_release);
-        RCLCPP_INFO(this->get_logger(), "Shutting down... Homing all joints over 2 seconds...");
+
+        if (use_arm_sdk_) {
+            RCLCPP_INFO(this->get_logger(), "Shutting down... Releasing control weight over 2 seconds...");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Shutting down... Homing all joints over 2 seconds...");
+        }
     }
 }
 
@@ -71,6 +121,9 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_moveit_bridge")
         motor_kd_[i] = GetMotorKd(G1MotorType[i]);
     }
 
+    use_arm_sdk_ = this->declare_parameter<bool>("use_arm_sdk", false);
+    control_weight_.store(use_arm_sdk_ ? 1.0f : 0.0f, std::memory_order_relaxed);
+
     msclient_ = std::make_shared<unitree::robot::g1::MotionSwitchClient>(this);
 
     // Defer motion switcher check and ROS interface creation to a background
@@ -79,22 +132,32 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_moveit_bridge")
     init_thread_ = std::thread([this]() {
         std::this_thread::sleep_for(1s);
 
-        int retries = 0;
-        while (queryMotionStatus() != 0) 
-        {
-            if (++retries > 10) {
-                RCLCPP_FATAL(this->get_logger(), "Failed to release motion mode after 10 attempts");
-                return;
+        if (!use_arm_sdk_) {
+            int retries = 0;
+            while (queryMotionStatus() != 0)
+            {
+                if (++retries > 10) {
+                    RCLCPP_FATAL(this->get_logger(), "Failed to release motion mode after 10 attempts");
+                    return;
+                }
+                std::cout << "Try to deactivate the motion control-related service." << std::endl;
+                int32_t ret = msclient_->ReleaseMode();
+                if (ret == 0) {
+                    std::cout << "ReleaseMode succeeded." << std::endl;
+                }
+                else {
+                    std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
+                }
+                std::this_thread::sleep_for(2s);
             }
-            std::cout << "Try to deactivate the motion control-related service." << std::endl;
-            int32_t ret = msclient_->ReleaseMode();
-            if (ret == 0) {
-                std::cout << "ReleaseMode succeeded." << std::endl;
-            } 
-            else {
-                std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
+        } else {
+            if (queryMotionStatus() == 0) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "High-level /arm_sdk mode selected, but no active motion service is detected. Ensure robot motion mode is enabled.");
+            } else {
+                RCLCPP_INFO(this->get_logger(), "High-level /arm_sdk mode selected. Keeping motion mode active.");
             }
-            std::this_thread::sleep_for(2s);
         }
 
         lowstate_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -113,12 +176,14 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_moveit_bridge")
         rclcpp::QoS qos_pub(rclcpp::KeepLast(1));
         qos_pub.reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
         lowcmd_publisher_ = this->create_publisher<unitree_hg::msg::LowCmd>("lowcmd", qos_pub);
+        arm_sdk_publisher_ = this->create_publisher<unitree_hg::msg::LowCmd>("arm_sdk", qos_pub);
+        const auto control_period = control_period_for_mode(use_arm_sdk_);
         command_writer_timer_ = this->create_wall_timer(
-            kControlPeriod,
+            control_period,
             std::bind(&G1MoveItBridge::command_writer_loop, this),
             command_writer_callback_group_);
         control_timer_ = this->create_wall_timer(
-            kControlPeriod,
+            control_period,
             std::bind(&G1MoveItBridge::control_loop, this),
             control_callback_group_);
 
@@ -134,7 +199,11 @@ G1MoveItBridge::G1MoveItBridge() : Node("g1_moveit_bridge")
             std::bind(&G1MoveItBridge::handle_cancel, this, std::placeholders::_1),
             std::bind(&G1MoveItBridge::handle_accepted, this, std::placeholders::_1));
 
-        RCLCPP_INFO(this->get_logger(), "MoveIt to Unitree LowCmd Bridge Started!");
+        if (use_arm_sdk_) {
+            RCLCPP_INFO(this->get_logger(), "MoveIt bridge started in high-level mode: publishing arm targets on /arm_sdk");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "MoveIt bridge started in low-level mode: publishing full-body commands on /lowcmd");
+        }
     });
 }
 
@@ -166,12 +235,26 @@ void G1MoveItBridge::lowstate_callback(const unitree_hg::msg::LowState::SharedPt
         RCLCPP_INFO(this->get_logger(), "Initial joint state captured. Start homing all joints to zero...");
 
         MotorCommand init_cmd;
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-            init_cmd.q_target[i] = motor_state.q[i];
-            init_cmd.dq_target[i] = 0.0f;
-            init_cmd.kp[i] = motor_kp_[i];
-            init_cmd.kd[i] = motor_kd_[i];
-            init_cmd.tau_ff[i] = 0.0f;
+        if (use_arm_sdk_) {
+            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                init_cmd.q_target[i] = motor_state.q[i];
+                init_cmd.dq_target[i] = 0.0f;
+                init_cmd.kp[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKp * kArmSdkWaistGainScale)
+                    : kArmSdkJointKp;
+                init_cmd.kd[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKd * kArmSdkWaistGainScale)
+                    : kArmSdkJointKd;
+                init_cmd.tau_ff[i] = 0.0f;
+            }
+        } else {
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                init_cmd.q_target[i] = motor_state.q[i];
+                init_cmd.dq_target[i] = 0.0f;
+                init_cmd.kp[i] = motor_kp_[i];
+                init_cmd.kd[i] = motor_kd_[i];
+                init_cmd.tau_ff[i] = 0.0f;
+            }
         }
         motor_command_buffer_.SetData(init_cmd);
     }
@@ -198,67 +281,144 @@ void G1MoveItBridge::command_writer_loop()
     if (previous_command) {
         command = *previous_command;
     } else if (auto state = motor_state_buffer_.GetData()) {
-        command.q_target = state->q;
-        command.dq_target.fill(0.0f);
+        if (use_arm_sdk_) {
+            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                command.q_target[i] = state->q[i];
+                command.dq_target[i] = 0.0f;
+            }
+        } else {
+            command.q_target = state->q;
+            command.dq_target.fill(0.0f);
+        }
     }
+
+    const int homing_steps = homing_steps_for_mode(use_arm_sdk_);
 
     if (shutdown_homing_active_.load(std::memory_order_acquire)) {
         const int step = shutdown_homing_step_.load(std::memory_order_acquire);
         const double ratio = std::clamp(
-            static_cast<double>(step) / static_cast<double>(kHomingSteps),
+            static_cast<double>(step) / static_cast<double>(homing_steps),
             0.0,
             1.0);
 
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-            command.q_target[i] = static_cast<float>(shutdown_homing_start_q_[i] * (1.0 - ratio));
-            command.dq_target[i] = 0.0f;
-            command.kp[i] = motor_kp_[i];
-            command.kd[i] = motor_kd_[i];
-            command.tau_ff[i] = 0.0f;
+        if (use_arm_sdk_) {
+            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                command.dq_target[i] = 0.0f;
+                command.kp[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKp * kArmSdkWaistGainScale)
+                    : kArmSdkJointKp;
+                command.kd[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKd * kArmSdkWaistGainScale)
+                    : kArmSdkJointKd;
+                command.tau_ff[i] = 0.0f;
+            }
+        } else {
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                command.dq_target[i] = 0.0f;
+                command.kp[i] = motor_kp_[i];
+                command.kd[i] = motor_kd_[i];
+                command.tau_ff[i] = 0.0f;
+            }
         }
 
-        if (IsCommandChanged(previous_command, command)) {
-            motor_command_buffer_.SetData(command);
+        if (use_arm_sdk_) {
+            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                command.q_target[i] = shutdown_homing_start_q_[i];
+            }
+            const float start_weight = shutdown_homing_start_weight_.load(std::memory_order_relaxed);
+            const float control_weight = std::clamp(static_cast<float>(start_weight * (1.0 - ratio)), 0.0f, 1.0f);
+            control_weight_.store(control_weight, std::memory_order_relaxed);
+        } else {
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                command.q_target[i] = static_cast<float>(shutdown_homing_start_q_[i] * (1.0 - ratio));
+            }
         }
 
-        if (step >= kHomingSteps) {
+        motor_command_buffer_.SetData(command);
+
+        if (step >= homing_steps) {
             shutdown_homing_active_.store(false, std::memory_order_release);
             shutdown_homing_done_.store(true, std::memory_order_release);
-            RCLCPP_INFO(this->get_logger(), "Returned to home. Exiting...");
+            if (use_arm_sdk_) {
+                RCLCPP_INFO(this->get_logger(), "Released control weight. Exiting...");
+            } else {
+                RCLCPP_INFO(this->get_logger(), "Returned to home. Exiting...");
+            }
         } else {
             shutdown_homing_step_.store(step + 1, std::memory_order_release);
         }
     } else {
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-            command.kp[i] = motor_kp_[i];
-            command.kd[i] = motor_kd_[i];
-            command.tau_ff[i] = 0.0f;
+        if (use_arm_sdk_) {
+            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                command.kp[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKp * kArmSdkWaistGainScale)
+                    : kArmSdkJointKp;
+                command.kd[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKd * kArmSdkWaistGainScale)
+                    : kArmSdkJointKd;
+                command.tau_ff[i] = 0.0f;
+            }
+        } else {
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                command.kp[i] = motor_kp_[i];
+                command.kd[i] = motor_kd_[i];
+                command.tau_ff[i] = 0.0f;
+            }
         }
 
         if (startup_homing_ratio_ < 1.0) {
-            // Startup homing: blend ALL joints from initial position to zero.
-            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-                command.q_target[i] = static_cast<float>(initial_q_[i] * (1.0 - startup_homing_ratio_));
-                command.dq_target[i] = 0.0f;
+            if (use_arm_sdk_) {
+                // Startup homing: blend arm_sdk joints from initial position to zero.
+                for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                    command.q_target[i] = static_cast<float>(initial_q_[i] * (1.0 - startup_homing_ratio_));
+                    command.dq_target[i] = 0.0f;
+                }
+                control_weight_.store(1.0f, std::memory_order_relaxed);
+            } else {
+                // Startup homing: blend all joints from initial position to zero.
+                for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                    command.q_target[i] = static_cast<float>(initial_q_[i] * (1.0 - startup_homing_ratio_));
+                    command.dq_target[i] = 0.0f;
+                }
             }
-            startup_homing_ratio_ += (1.0 / static_cast<double>(kHomingSteps));
+            startup_homing_ratio_ += (1.0 / static_cast<double>(homing_steps));
             if (startup_homing_ratio_ > 1.0) startup_homing_ratio_ = 1.0;
         } else if (!startup_homing_done_.load(std::memory_order_acquire)) {
-            // Final tick: clamp all joints to exact zero and mark done.
-            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-                command.q_target[i] = 0.0f;
-                command.dq_target[i] = 0.0f;
+            if (use_arm_sdk_) {
+                // Final tick: clamp arm_sdk joints to exact zero and mark done.
+                for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                    command.q_target[i] = 0.0f;
+                    command.dq_target[i] = 0.0f;
+                }
+                control_weight_.store(1.0f, std::memory_order_relaxed);
+                startup_homing_done_.store(true, std::memory_order_release);
+                RCLCPP_INFO(this->get_logger(), "Startup homing complete. All arm & waist joints at zero. Ready for trajectories.");
+            } else {
+                // Final tick: clamp all joints to exact zero and mark done.
+                for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                    command.q_target[i] = 0.0f;
+                    command.dq_target[i] = 0.0f;
+                }
+                startup_homing_done_.store(true, std::memory_order_release);
+                RCLCPP_INFO(this->get_logger(), "Startup homing complete. All joints at zero. Ready for trajectories.");
             }
-            startup_homing_done_.store(true, std::memory_order_release);
-            RCLCPP_INFO(this->get_logger(), "Startup homing complete. All joints at zero. Ready for trajectories.");
         } else {
-            // Normal operation: trajectory state machine drives arms,
-            // lower body stays pinned to zero.
+            // Normal operation: trajectory state machine drives arms.
             run_trajectory_state_machine(this->now(), command);
 
-            for (int i = 0; i < 15; ++i) {
-                command.q_target[i] = 0.0f;
-                command.dq_target[i] = 0.0f;
+            if (!use_arm_sdk_) {
+                // In low-level mode keep non-arm joints pinned at zero.
+                for (int i = 0; i < 15; ++i) {
+                    command.q_target[i] = 0.0f;
+                    command.dq_target[i] = 0.0f;
+                }
+            } else {
+                // In high-level mode keep waist joints at home (0 rad) with higher gains.
+                for (int i = kWaistFirstJoint; i <= kWaistLastJoint; ++i) {
+                    command.q_target[i] = 0.0f;
+                    command.dq_target[i] = 0.0f;
+                }
+                control_weight_.store(1.0f, std::memory_order_relaxed);
             }
         }
 
@@ -294,21 +454,26 @@ void G1MoveItBridge::control_loop()
     auto command = motor_command_buffer_.GetData();
     if (!command) return;
 
-    unitree_hg::msg::LowCmd low_cmd;
-    low_cmd.mode_pr = mode_pr_;
-    low_cmd.mode_machine = mode_machine_.load(std::memory_order_relaxed);
+    if (use_arm_sdk_) {
+        if (!arm_sdk_publisher_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "arm_sdk publisher not ready.");
+            return;
+        }
 
-    for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        low_cmd.motor_cmd[i].mode = 0x01;
-        low_cmd.motor_cmd[i].q = command->q_target[i];
-        low_cmd.motor_cmd[i].dq = command->dq_target[i];
-        low_cmd.motor_cmd[i].tau = command->tau_ff[i];
-        low_cmd.motor_cmd[i].kp = command->kp[i];
-        low_cmd.motor_cmd[i].kd = command->kd[i];
+        unitree_hg::msg::LowCmd arm_cmd;
+        populate_arm_sdk_message(*command, arm_cmd);
+        arm_sdk_publisher_->publish(arm_cmd);
+    } else {
+        if (!lowcmd_publisher_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "lowcmd publisher not ready.");
+            return;
+        }
+
+        unitree_hg::msg::LowCmd low_cmd;
+        populate_low_cmd_message(*command, low_cmd);
+        get_crc(low_cmd);
+        lowcmd_publisher_->publish(low_cmd);
     }
-
-    get_crc(low_cmd);
-    lowcmd_publisher_->publish(low_cmd);
 
     if (loop_period_ms >= 0.0 && loop_period_ms > kLoopOverrunThresholdMs) {
         RCLCPP_WARN_THROTTLE(
@@ -319,6 +484,38 @@ void G1MoveItBridge::control_loop()
             loop_period_ms,
             kLoopOverrunThresholdMs);
     }
+}
+
+void G1MoveItBridge::populate_low_cmd_message(const MotorCommand &command, unitree_hg::msg::LowCmd &low_cmd) const
+{
+    low_cmd.mode_pr = mode_pr_;
+    low_cmd.mode_machine = mode_machine_.load(std::memory_order_relaxed);
+
+    for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        low_cmd.motor_cmd[i].mode = 0x01;
+        low_cmd.motor_cmd[i].q = command.q_target[i];
+        low_cmd.motor_cmd[i].dq = command.dq_target[i];
+        low_cmd.motor_cmd[i].tau = command.tau_ff[i];
+        low_cmd.motor_cmd[i].kp = command.kp[i];
+        low_cmd.motor_cmd[i].kd = command.kd[i];
+    }
+}
+
+void G1MoveItBridge::populate_arm_sdk_message(const MotorCommand &command, unitree_hg::msg::LowCmd &arm_cmd) const
+{
+    // arm_cmd.mode_pr = mode_pr_;
+    // arm_cmd.mode_machine = mode_machine_.load(std::memory_order_relaxed);
+
+    for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+        // arm_cmd.motor_cmd[i].mode = 0x01;
+        arm_cmd.motor_cmd[i].q = command.q_target[i];
+        arm_cmd.motor_cmd[i].dq = command.dq_target[i];
+        arm_cmd.motor_cmd[i].tau = command.tau_ff[i];
+        arm_cmd.motor_cmd[i].kp = command.kp[i];
+        arm_cmd.motor_cmd[i].kd = command.kd[i];
+    }
+
+    arm_cmd.motor_cmd[kArmSdkWeightJoint].q = std::clamp(control_weight_.load(std::memory_order_relaxed), 0.0f, 1.0f);
 }
 
 rclcpp_action::GoalResponse G1MoveItBridge::handle_goal(
@@ -827,27 +1024,78 @@ void G1MoveItBridge::perform_shutdown_homing()
 
     // Fallback path used during teardown when executor callbacks are no longer spinning.
     if (!shutdown_homing_done_.load(std::memory_order_acquire)) {
-        unitree_hg::msg::LowCmd low_cmd;
-        low_cmd.mode_pr = mode_pr_;
-        low_cmd.mode_machine = mode_machine_.load(std::memory_order_relaxed);
-
-        for (int step = 0; step <= kHomingSteps; ++step) {
-            const double ratio = static_cast<double>(step) / static_cast<double>(kHomingSteps);
-            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-                low_cmd.motor_cmd[i].mode = 0x01;
-                low_cmd.motor_cmd[i].q = shutdown_homing_start_q_[i] * (1.0 - ratio);
-                low_cmd.motor_cmd[i].dq = 0.0;
-                low_cmd.motor_cmd[i].tau = 0.0;
-                low_cmd.motor_cmd[i].kp = motor_kp_[i];
-                low_cmd.motor_cmd[i].kd = motor_kd_[i];
-            }
-            get_crc(low_cmd);
-            lowcmd_publisher_->publish(low_cmd);
-            std::this_thread::sleep_for(kControlPeriod);
+        if (use_arm_sdk_ && !arm_sdk_publisher_) {
+            RCLCPP_WARN(this->get_logger(), "arm_sdk publisher unavailable during shutdown fallback.");
+            shutdown_homing_done_.store(true, std::memory_order_release);
+            return;
         }
+        if (!use_arm_sdk_ && !lowcmd_publisher_) {
+            RCLCPP_WARN(this->get_logger(), "lowcmd publisher unavailable during shutdown fallback.");
+            shutdown_homing_done_.store(true, std::memory_order_release);
+            return;
+        }
+
+        MotorCommand command;
+
+        if (use_arm_sdk_) {
+            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                command.kp[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKp * kArmSdkWaistGainScale)
+                    : kArmSdkJointKp;
+                command.kd[i] = is_waist_joint(i)
+                    ? (kArmSdkJointKd * kArmSdkWaistGainScale)
+                    : kArmSdkJointKd;
+                command.tau_ff[i] = 0.0f;
+            }
+        } else {
+            for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                command.kp[i] = motor_kp_[i];
+                command.kd[i] = motor_kd_[i];
+                command.tau_ff[i] = 0.0f;
+            }
+        }
+
+        const float start_weight = shutdown_homing_start_weight_.load(std::memory_order_relaxed);
+        const int homing_steps = homing_steps_for_mode(use_arm_sdk_);
+        const auto control_period = control_period_for_mode(use_arm_sdk_);
+        for (int step = 0; step <= homing_steps; ++step) {
+            const double ratio = static_cast<double>(step) / static_cast<double>(homing_steps);
+
+            if (use_arm_sdk_) {
+                for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                    command.q_target[i] = shutdown_homing_start_q_[i];
+                    command.dq_target[i] = 0.0f;
+                }
+                const float control_weight = std::clamp(static_cast<float>(start_weight * (1.0 - ratio)), 0.0f, 1.0f);
+                control_weight_.store(control_weight, std::memory_order_relaxed);
+            } else {
+                for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                    command.q_target[i] = static_cast<float>(shutdown_homing_start_q_[i] * (1.0 - ratio));
+                    command.dq_target[i] = 0.0f;
+                }
+            }
+
+            if (use_arm_sdk_) {
+                unitree_hg::msg::LowCmd arm_cmd;
+                populate_arm_sdk_message(command, arm_cmd);
+                arm_sdk_publisher_->publish(arm_cmd);
+            } else {
+                unitree_hg::msg::LowCmd low_cmd;
+                populate_low_cmd_message(command, low_cmd);
+                get_crc(low_cmd);
+                lowcmd_publisher_->publish(low_cmd);
+            }
+
+            std::this_thread::sleep_for(control_period);
+        }
+
         shutdown_homing_active_.store(false, std::memory_order_release);
         shutdown_homing_done_.store(true, std::memory_order_release);
-        RCLCPP_INFO(this->get_logger(), "Returned to home. Exiting...");
+        if (use_arm_sdk_) {
+            RCLCPP_INFO(this->get_logger(), "Released control weight. Exiting...");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Returned to home. Exiting...");
+        }
     }
 }
 
