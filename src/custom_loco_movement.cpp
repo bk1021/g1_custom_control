@@ -343,9 +343,9 @@ private:
     }
     sleep_seconds(forward_duration_s_ + settle_duration_s_);
 
-    const auto turn_ret = loco_client_.SetVelocity(
+    const auto turn_1_ret = loco_client_.SetVelocity(
       0.0F, 0.0F, static_cast<float>(turn_speed_radps_), static_cast<float>(uturn_duration_s_));
-    if (!handle_action_result("SetVelocity(U-turn)", turn_ret)) {
+    if (!handle_action_result("SetVelocity(U-turn)", turn_1_ret)) {
       safe_stop();
       request_shutdown();
       return;
@@ -360,6 +360,15 @@ private:
       return;
     }
     sleep_seconds(forward_duration_s_ + settle_duration_s_);
+
+    const auto turn_2_ret = loco_client_.SetVelocity(
+      0.0F, 0.0F, static_cast<float>(turn_speed_radps_), static_cast<float>(uturn_duration_s_));
+    if (!handle_action_result("SetVelocity(U-turn)", turn_2_ret)) {
+      safe_stop();
+      request_shutdown();
+      return;
+    }
+    sleep_seconds(uturn_duration_s_ + settle_duration_s_);
 
     safe_stop();
     RCLCPP_INFO(this->get_logger(), "Predefined movement sequence completed");
