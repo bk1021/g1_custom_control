@@ -44,7 +44,7 @@ class LocoClient {
  public:
   explicit LocoClient(rclcpp::Node* node)
       : node_(node),
-        base_client_(node_, "/api/sport/request", "/api/sport/response") {}
+        base_client_(node_, "/api/loco/request", "/api/loco/response") {}
 
   /*Low Level API Call*/
   int32_t GetFsmId(int& fsm_id) {
