@@ -40,11 +40,11 @@ public:
   CustomLocoMovementNode()
   : Node("custom_loco_movement"), loco_client_(this)
   {
-    forward_speed_mps_ = this->declare_parameter<double>("forward_speed_mps", 0.25);
+    forward_speed_mps_ = this->declare_parameter<double>("forward_speed_mps", 0.5);
     turn_speed_radps_ = this->declare_parameter<double>("turn_speed_radps", 0.70);
-    forward_duration_s_ = this->declare_parameter<double>("forward_duration_s", 2.5);
-    uturn_duration_s_ = this->declare_parameter<double>("uturn_duration_s", 4.5);
-    settle_duration_s_ = this->declare_parameter<double>("settle_duration_s", 0.5);
+    forward_duration_s_ = this->declare_parameter<double>("forward_duration_s", 5);
+    uturn_duration_s_ = this->declare_parameter<double>("uturn_duration_s", 5.0);
+    settle_duration_s_ = this->declare_parameter<double>("settle_duration_s", 1.0);
     arm_home_startup_s_ = this->declare_parameter<double>("arm_home_startup_s", 2.0);
     arm_home_publish_period_s_ = this->declare_parameter<double>("arm_home_publish_period_s", 0.02);
     arm_home_control_weight_ = this->declare_parameter<double>("arm_home_control_weight", 1.0);
@@ -331,7 +331,7 @@ private:
     sleep_seconds(forward_duration_s_ + settle_duration_s_);
 
     const auto turn_2_ret = loco_client_.SetVelocity(
-      0.0F, 0.0F, static_cast<float>(turn_speed_radps_), static_cast<float>(uturn_duration_s_));
+      0.0F, 0.0F, static_cast<float>(-1 * turn_speed_radps_), static_cast<float>(uturn_duration_s_));
     if (!handle_action_result("SetVelocity(U-turn)", turn_2_ret)) {
       safe_stop();
       request_shutdown();
