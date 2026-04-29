@@ -1,4 +1,5 @@
 #include "g1_custom_control/g1_moveit_bridge.hpp"
+#include "g1_custom_control/g1_control_constants.hpp"
 #include "g1/motor_crc_hg.h"
 #include "g1/g1_motion_switch_client.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
@@ -10,40 +11,15 @@
 #include <stdexcept>
 #include <thread>
 
+using namespace g1_custom_control;
 using namespace std::chrono_literals;
 
 namespace {
 std::atomic<bool> g_sigint_requested{false};
 
-constexpr auto kLowCmdControlPeriod = 2ms;
-constexpr auto kArmSdkControlPeriod = 20ms;
-constexpr int kLowCmdHomingSteps = 1000;
-constexpr int kArmSdkHomingSteps = 100;
-constexpr double kLowCmdLoopOverrunThresholdMs = 2.2;
-constexpr double kArmSdkLoopOverrunThresholdMs = 21.0;
 constexpr double kOnePointFallbackDurationSec = 0.2;
 constexpr double kSettleDurationSec = 0.5;
 constexpr double kGoalToleranceRad = 0.10;
-constexpr float kArmSdkJointKp = 60.0f;
-constexpr float kArmSdkJointKd = 1.5f;
-constexpr float kArmSdkWaistGainScale = 4.0f;
-constexpr int kWaistFirstJoint = 12;
-constexpr int kWaistLastJoint = 14;
-constexpr int kArmSdkFirstJoint = 12;
-constexpr int kArmSdkLastJoint = 28;
-constexpr int kArmSdkWeightJoint = 29;
-
-constexpr bool is_waist_joint(const int idx)
-{ return idx >= kWaistFirstJoint && idx <= kWaistLastJoint; }
-
-constexpr int homing_steps_for_mode(const bool use_arm_sdk)
-{ return use_arm_sdk ? kArmSdkHomingSteps : kLowCmdHomingSteps; }
-
-constexpr auto control_period_for_mode(const bool use_arm_sdk)
-{ return use_arm_sdk ? kArmSdkControlPeriod : kLowCmdControlPeriod; }
-
-constexpr double loop_overrun_threshold_for_mode(const bool use_arm_sdk)
-{ return use_arm_sdk ? kArmSdkLoopOverrunThresholdMs : kLowCmdLoopOverrunThresholdMs; }
 
 void sigint_handler(int)
 {

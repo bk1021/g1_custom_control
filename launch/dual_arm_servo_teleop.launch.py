@@ -2,6 +2,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
 
@@ -70,10 +72,24 @@ def generate_launch_description():
         parameters=[joy_mapper_yaml],
     )
 
+    servo_bridge_node = Node(
+        package="g1_custom_control",
+        executable="g1_servo_bridge",
+        name="g1_servo_bridge",
+        output="screen",
+        parameters=[{"use_arm_sdk": LaunchConfiguration("use_arm_sdk")}],
+    )
+
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "use_arm_sdk",
+            default_value="true",
+            description="Servo bridge hardware interface: true=arm_sdk (standing robot), false=lowcmd (released mode)",
+        ),
         move_group_node,
         left_servo_node,
         right_servo_node,
         joy_node,
         joy_mapper_node,
+        servo_bridge_node,
     ])

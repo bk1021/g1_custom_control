@@ -209,15 +209,17 @@ class JoyToServoMapper(Node):
             self._publish_twist(self.right_twist_pub, self.right_command_frame, 0.0, 0.0, 0.0, right_y * self.rotation_speed, right_x * self.rotation_speed, right_z * self.rotation_speed)
 
     def _publish_joint_mode(self, joy: Joy, deadman_active: bool) -> None:
-        velocity = self._apply_deadzone(self._get_axis(self.latest_joy, self.axis_left_y)) * self.joint_speed
+        velocity = self._apply_deadzone(self._get_axis(joy, self.axis_left_y)) * self.joint_speed
         if not deadman_active:
             velocity = 0.0
 
         if self.selected_joint < len(self.left_joint_names):
             self._publish_joint_jog(self.left_joint_pub, self.left_joint_names[self.selected_joint], velocity)
+            self._publish_joint_jog(self.right_joint_pub, self.right_joint_names[0], 0.0)
         else:
             idx = self.selected_joint - len(self.left_joint_names)
             self._publish_joint_jog(self.right_joint_pub, self.right_joint_names[idx], velocity)
+            self._publish_joint_jog(self.left_joint_pub, self.left_joint_names[0], 0.0)
 
     def _publish_twist(
         self,

@@ -1,6 +1,7 @@
 #ifndef G1_CUSTOM_CONTROL__G1_MOVEIT_BRIDGE_HPP_
 #define G1_CUSTOM_CONTROL__G1_MOVEIT_BRIDGE_HPP_
 
+#include "g1_custom_control/g1_control_constants.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
@@ -9,40 +10,13 @@
 #include "unitree_hg/msg/low_state.hpp"
 #include "g1/g1_motion_switch_client.hpp"
 
-#include <array>
 #include <atomic>
-#include <chrono>
-#include <map>
-#include <memory>
 #include <mutex>
-#include <shared_mutex>
-#include <string>
-#include <vector>
 
 namespace g1_custom_control {
 
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using GoalHandleFJT = rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
-
-constexpr int G1_NUM_MOTOR = 29;
-
-enum MotorType { GEARBOX_S = 0, GEARBOX_M = 1, GEARBOX_L = 2 };
-
-const std::array<MotorType, G1_NUM_MOTOR> G1MotorType{
-    GEARBOX_M, GEARBOX_M, GEARBOX_M, GEARBOX_L, GEARBOX_S, GEARBOX_S, // Left Leg
-    GEARBOX_M, GEARBOX_M, GEARBOX_M, GEARBOX_L, GEARBOX_S, GEARBOX_S, // Right Leg
-    GEARBOX_M, GEARBOX_S, GEARBOX_S,                                  // Waist
-    GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, // Left Arm
-    GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S, GEARBOX_S  // Right Arm
-};
-
-inline float GetMotorKp(MotorType type) {
-    switch (type) { case GEARBOX_S: case GEARBOX_M: return 40.0; case GEARBOX_L: return 100.0; default: return 0.0; }
-}
-
-inline float GetMotorKd(MotorType type) {
-    switch (type) { case GEARBOX_S: case GEARBOX_M: case GEARBOX_L: return 1.0; default: return 0.0; }
-}
 
 template <typename CommandT>
 inline bool IsCommandChanged(
@@ -56,52 +30,6 @@ inline bool IsCommandChanged(
            next.kd != previous->kd ||
            next.tau_ff != previous->tau_ff;
 }
-
-const std::vector<std::string> JOINT_NAMES = {
-    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", 
-    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
-    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", 
-    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
-    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", 
-    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", 
-    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"
-};
-
-inline const std::map<std::string, int> JOINT_NAME_TO_IDX = []() {
-    std::map<std::string, int> mp;
-    for (size_t i = 0; i < JOINT_NAMES.size(); ++i) {
-        mp[JOINT_NAMES[i]] = i;
-    }
-    return mp;
-}();
-
-template <typename T>
-class DataBuffer {
-public:
-    void SetData(const T &new_data)
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        data_ = std::make_shared<T>(new_data);
-    }
-
-    std::shared_ptr<const T> GetData()
-    {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        return data_ ? data_ : nullptr;
-    }
-
-    void Clear()
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        data_ = nullptr;
-    }
-
-private:
-    std::shared_ptr<T> data_;
-    std::shared_mutex mutex_;
-};
 
 class G1MoveItBridge : public rclcpp::Node {
 public:
