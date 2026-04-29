@@ -5,22 +5,22 @@ joy_to_servo_mapper:
     deadzone: 0.10
 
     # Set to -1 to disable deadman gating.
-    deadman_button_index: -1
+    deadman_button_index: 2 #-1
     mode_cycle_button_index: 3
 
-    # F710 X-mode typical axis layout on Linux joy_node.
+    # F710 D-mode typical axis layout on Linux joy_node.
     axis_left_x: 0
     axis_left_y: 1
-    axis_right_x: 3
-    axis_right_y: 4
-    axis_dpad_x: 6
-    axis_dpad_y: 7
+    axis_right_x: 2 #3
+    axis_right_y: 3 #4
+    axis_dpad_x: 4 #6
+    axis_dpad_y: 5 #7
 
     # Set per your button mapping. -1 disables that direction.
     button_left_up: 4
-    button_left_down: -1
+    button_left_down: 6 #-1
     button_right_up: 5
-    button_right_down: -1
+    button_right_down: 7 #-1
 
     translation_speed: 0.20
     z_speed: 0.20
