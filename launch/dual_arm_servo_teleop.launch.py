@@ -2,8 +2,6 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
 
@@ -21,11 +19,13 @@ def generate_launch_description():
     right_servo_yaml = os.path.join(this_pkg_share, "config", "servo_right_arm.yaml")
     joy_mapper_yaml = os.path.join(this_pkg_share, "config", "joy_to_servo_f710.yaml")
 
-    move_group_node = Node(
-        package="moveit_ros_move_group",
-        executable="move_group",
-        output="screen",
-        parameters=[moveit_config.to_dict(), {"use_sim_time": False}],
+    # Publish a static identity transform world→pelvis so MoveIt Servo can resolve
+    # the virtual_joint and compute Jacobians for Cartesian IK.
+    static_tf_node = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="world_to_pelvis",
+        arguments=["0", "0", "0", "0", "0", "0", "world", "pelvis"],
     )
 
     left_servo_node = Node(
@@ -33,6 +33,7 @@ def generate_launch_description():
         executable="servo_node_main",
         name="left_servo",
         output="screen",
+        emulate_tty=True,
         parameters=[moveit_config.to_dict(), left_servo_yaml],
         remappings=[
             ("~/delta_twist_cmds", "/left_servo/delta_twist_cmds"),
@@ -45,6 +46,7 @@ def generate_launch_description():
         executable="servo_node_main",
         name="right_servo",
         output="screen",
+        emulate_tty=True,
         parameters=[moveit_config.to_dict(), right_servo_yaml],
         remappings=[
             ("~/delta_twist_cmds", "/right_servo/delta_twist_cmds"),
@@ -72,24 +74,10 @@ def generate_launch_description():
         parameters=[joy_mapper_yaml],
     )
 
-    servo_bridge_node = Node(
-        package="g1_custom_control",
-        executable="g1_servo_bridge",
-        name="g1_servo_bridge",
-        output="screen",
-        parameters=[{"use_arm_sdk": LaunchConfiguration("use_arm_sdk")}],
-    )
-
     return LaunchDescription([
-        DeclareLaunchArgument(
-            "use_arm_sdk",
-            default_value="true",
-            description="Servo bridge hardware interface: true=arm_sdk (standing robot), false=lowcmd (released mode)",
-        ),
-        move_group_node,
+        static_tf_node,
         left_servo_node,
         right_servo_node,
         joy_node,
         joy_mapper_node,
-        servo_bridge_node,
     ])

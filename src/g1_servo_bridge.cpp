@@ -342,12 +342,15 @@ void G1ServoBridge::traj_callback(const trajectory_msgs::msg::JointTrajectory::S
 
         cmd.q_target[idx]  = static_cast<float>(pt.positions[j]);
         cmd.dq_target[idx] = has_vel ? static_cast<float>(pt.velocities[j]) : 0.0f;
-        cmd.kp[idx] = is_waist_joint(idx)
-            ? kArmSdkJointKp * kArmSdkWaistGainScale
-            : kArmSdkJointKp;
-        cmd.kd[idx] = is_waist_joint(idx)
-            ? kArmSdkJointKd * kArmSdkWaistGainScale
-            : kArmSdkJointKd;
+        if (use_arm_sdk_) {
+            cmd.kp[idx] = is_waist_joint(idx)
+                ? kArmSdkJointKp * kArmSdkWaistGainScale : kArmSdkJointKp;
+            cmd.kd[idx] = is_waist_joint(idx)
+                ? kArmSdkJointKd * kArmSdkWaistGainScale : kArmSdkJointKd;
+        } else {
+            cmd.kp[idx] = motor_kp_[idx];
+            cmd.kd[idx] = motor_kd_[idx];
+        }
         cmd.tau_ff[idx] = 0.0f;
     }
     cmd_buffer_.SetData(cmd);
@@ -375,37 +378,45 @@ void G1ServoBridge::control_loop()
     SBMotorCommand cmd = cmd_ptr ? *cmd_ptr : SBMotorCommand{};
     const int homing_steps = homing_steps_for_mode(use_arm_sdk_);
 
-    // ---- Startup: arm_sdk ramps control_weight_ 0→1 while holding initial positions ----
+    // ---- Startup: home arm joints to 0; arm_sdk also ramps control_weight_ 0→1 ----
     if (!startup_done_.load(std::memory_order_acquire)) {
-        // If shutdown arrives before startup completes, abort startup immediately.
         if (shutdown_requested_.load(std::memory_order_acquire)) {
             control_weight_.store(0.0f, std::memory_order_relaxed);
             startup_done_.store(true, std::memory_order_release);
-        } else if (use_arm_sdk_) {
-            const float w = std::clamp(
+        } else {
+            const float ratio = std::clamp(
                 static_cast<float>(startup_step_) / static_cast<float>(homing_steps),
                 0.0f, 1.0f);
-            control_weight_.store(w, std::memory_order_relaxed);
-            for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
-                cmd.q_target[i]  = initial_q_[i];
-                cmd.dq_target[i] = 0.0f;
-                cmd.kp[i] = is_waist_joint(i)
-                    ? kArmSdkJointKp * kArmSdkWaistGainScale : kArmSdkJointKp;
-                cmd.kd[i] = is_waist_joint(i)
-                    ? kArmSdkJointKd * kArmSdkWaistGainScale : kArmSdkJointKd;
+            if (use_arm_sdk_) {
+                control_weight_.store(ratio, std::memory_order_relaxed);
+                for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                    cmd.q_target[i]  = initial_q_[i] * (1.0f - ratio);
+                    cmd.dq_target[i] = 0.0f;
+                    cmd.kp[i] = is_waist_joint(i)
+                        ? kArmSdkJointKp * kArmSdkWaistGainScale : kArmSdkJointKp;
+                    cmd.kd[i] = is_waist_joint(i)
+                        ? kArmSdkJointKd * kArmSdkWaistGainScale : kArmSdkJointKd;
+                }
+            } else {
+                for (int i = kArmSdkFirstJoint; i <= kArmSdkLastJoint; ++i) {
+                    cmd.q_target[i]  = initial_q_[i] * (1.0f - ratio);
+                    cmd.dq_target[i] = 0.0f;
+                    cmd.kp[i]  = motor_kp_[i];
+                    cmd.kd[i]  = motor_kd_[i];
+                    cmd.tau_ff[i] = 0.0f;
+                }
             }
             if (startup_step_ >= homing_steps) {
-                control_weight_.store(1.0f, std::memory_order_relaxed);
+                if (use_arm_sdk_) control_weight_.store(1.0f, std::memory_order_relaxed);
+                cmd_buffer_.SetData(cmd);
                 startup_done_.store(true, std::memory_order_release);
                 RCLCPP_INFO(this->get_logger(),
-                    "arm_sdk control weight at 1.0. Accepting Servo commands.");
+                    use_arm_sdk_
+                        ? "Startup homing complete (arm_sdk). Accepting Servo commands."
+                        : "Startup homing complete (lowcmd). Accepting Servo commands.");
             } else {
                 ++startup_step_;
             }
-        } else {
-            // lowcmd: no weight ramp needed
-            startup_done_.store(true, std::memory_order_release);
-            RCLCPP_INFO(this->get_logger(), "Servo bridge ready (lowcmd). Accepting Servo commands.");
         }
     }
 
