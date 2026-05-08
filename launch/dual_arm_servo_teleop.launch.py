@@ -30,7 +30,7 @@ def generate_launch_description():
 
     left_servo_node = Node(
         package="moveit_servo",
-        executable="servo_node_main",
+        executable="servo_node",
         name="left_servo",
         output="screen",
         emulate_tty=True,
@@ -43,7 +43,7 @@ def generate_launch_description():
 
     right_servo_node = Node(
         package="moveit_servo",
-        executable="servo_node_main",
+        executable="servo_node",
         name="right_servo",
         output="screen",
         emulate_tty=True,

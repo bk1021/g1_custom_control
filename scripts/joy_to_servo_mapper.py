@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import threading
 from typing import List
 
 import rclpy
@@ -7,6 +8,7 @@ from rclpy.node import Node
 
 from control_msgs.msg import JointJog
 from geometry_msgs.msg import TwistStamped
+from moveit_msgs.srv import ServoCommandType
 from sensor_msgs.msg import Joy
 
 
@@ -40,8 +42,15 @@ class JoyToServoMapper(Node):
         self.left_joint_pub = self.create_publisher(JointJog, self.left_joint_topic, 10)
         self.right_joint_pub = self.create_publisher(JointJog, self.right_joint_topic, 10)
 
+        self.left_cmd_type_client = self.create_client(
+            ServoCommandType, "/left_servo/switch_command_type")
+        self.right_cmd_type_client = self.create_client(
+            ServoCommandType, "/right_servo/switch_command_type")
+
         self.create_subscription(Joy, self.joy_topic, self._joy_callback, 10)
         self.create_timer(1.0 / self.publish_rate_hz, self._tick)
+
+        threading.Thread(target=self._init_command_type, daemon=True).start()
 
         self.get_logger().info(
             "joy_to_servo_mapper started. mode=%s, publish_rate=%.1f Hz"
@@ -154,6 +163,10 @@ class JoyToServoMapper(Node):
         if self._rising_button(msg, self.mode_cycle_button_index):
             self.mode = (self.mode + 1) % 3
             self.get_logger().info("Mode switched to %s" % MODE_NAMES[self.mode])
+            self._switch_servo_command_type(
+                ServoCommandType.Request.JOINT_JOG if self.mode == MODE_JOINT
+                else ServoCommandType.Request.TWIST
+            )
 
         dpad_y = self._get_axis(msg, self.axis_dpad_y)
         dpad_up = dpad_y > 0.5
@@ -252,6 +265,18 @@ class JoyToServoMapper(Node):
         msg.velocities = [float(velocity)]
         msg.duration = 1.0 / self.publish_rate_hz
         publisher.publish(msg)
+
+    def _init_command_type(self) -> None:
+        self.left_cmd_type_client.wait_for_service()
+        self.right_cmd_type_client.wait_for_service()
+        self._switch_servo_command_type(ServoCommandType.Request.TWIST)
+        self.get_logger().info("Servo command type initialized to TWIST")
+
+    def _switch_servo_command_type(self, command_type: int) -> None:
+        req = ServoCommandType.Request()
+        req.command_type = command_type
+        self.left_cmd_type_client.call_async(req)
+        self.right_cmd_type_client.call_async(req)
 
     def _deadman_active(self, msg: Joy) -> bool:
         if self.deadman_button_index < 0:
